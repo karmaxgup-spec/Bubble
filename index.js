@@ -1,6 +1,6 @@
 // Bubble Splitter — Visual Only
-// User + assistant bubbles, custom colors, single-bubble fallback.
-// Only rendered DOM is modified. Chat objects and payloads are not modified.
+// User + assistant bubbles, custom colors, and Render All Messages.
+// Only rendered DOM is modified; chat objects and payloads are not intentionally changed.
 
 (() => {
     'use strict';
@@ -62,7 +62,7 @@
     }
 
     // --------------------------------------------------
-    // CUSTOM COLOR PALETTE
+    // COLOR PALETTE
     // --------------------------------------------------
 
     function updatePalette() {
@@ -87,7 +87,6 @@
                 border-radius: 0.8em;
                 white-space: pre-wrap;
                 overflow-wrap: anywhere;
-                word-break: normal;
             }
 
             #chat .mes .bs-visual-bubble[data-bs-role="assistant"] {
@@ -123,7 +122,7 @@
         return value ? value.split(/\s+/).length : 0;
     }
 
-    // Keep tool-call JSON together instead of splitting its fields.
+    // Keep tool-call JSON together when it appears in rendered text.
     function findToolPayload(text) {
         const patterns = [
             /\{\s*"tool_calls"\s*:/,
@@ -135,7 +134,10 @@
         for (const pattern of patterns) {
             const match = pattern.exec(text);
 
-            if (match && (earliest === -1 || match.index < earliest)) {
+            if (
+                match &&
+                (earliest === -1 || match.index < earliest)
+            ) {
                 earliest = match.index;
             }
         }
@@ -146,15 +148,13 @@
     function splitText(text) {
         const payloadStart = findToolPayload(text);
 
-        // Never create sentence boundaries inside the detected JSON payload.
-        const splitLimit = payloadStart === -1
-            ? text.length
-            : payloadStart;
+        const prefix = text.slice(
+            0,
+            payloadStart === -1 ? text.length : payloadStart
+        );
 
-        const prefix = text.slice(0, splitLimit);
         const ranges = [];
 
-        // Split at sentence-ending punctuation and line breaks.
         const boundary =
             /[.!?…]+["'”’)\]*_~]*(?=\s|$)|\n+/g;
 
@@ -167,7 +167,7 @@
             const word = before.match(/([A-Za-z.]+)$/);
 
             if (
-                /^[.]/.test(match[0]) &&
+                match[0].startsWith('.') &&
                 word &&
                 ABBREVIATIONS.has(word[1].toLowerCase())
             ) {
@@ -184,7 +184,7 @@
             last = end;
         }
 
-        // Preserve all remaining text, including any complete JSON payload.
+        // Preserve the remaining text, including the complete detected payload.
         if (last < text.length && text.slice(last).trim()) {
             ranges.push({
                 start: last,
@@ -238,9 +238,11 @@
         return bubble;
     }
 
-    // Every message gets at least one bubble, even if it is short.
+    // Always display at least one bubble.
     function wrapSingleBubble(element, role) {
-        if (!element || !element.isConnected) return false;
+        if (!element || !element.isConnected) {
+            return false;
+        }
 
         if (element.dataset.bsVisualSplit === 'true') {
             return true;
@@ -258,9 +260,10 @@
         return true;
     }
 
-    // Split only the already-rendered DOM. No chat data is written.
     function splitRenderedElement(element, role, settings) {
-        if (!element || !element.isConnected) return false;
+        if (!element || !element.isConnected) {
+            return false;
+        }
 
         if (element.dataset.bsVisualSplit === 'true') {
             return true;
@@ -268,19 +271,18 @@
 
         const originalText = element.textContent || '';
 
-        // Short messages still receive a single styled bubble.
         if (countWords(originalText) <= Number(settings.minWords)) {
             return false;
         }
 
-        const ranges = splitText(originalText);
-
-        if (ranges.length < 2) {
+        // Avoid splitting code and preformatted content.
+        if (element.querySelector('pre, code, .code-block')) {
             return false;
         }
 
-        // Keep splitting from touching code blocks or preformatted content.
-        if (element.querySelector('pre, code, .code-block')) {
+        let ranges = splitText(originalText);
+
+        if (ranges.length < 2) {
             return false;
         }
 
@@ -292,7 +294,6 @@
             )
         );
 
-        // Merge excess ranges into the final bubble.
         if (ranges.length > max) {
             const reduced = ranges.slice(0, max - 1);
 
@@ -301,8 +302,7 @@
                 end: ranges[ranges.length - 1].end
             });
 
-            ranges.length = 0;
-            ranges.push(...reduced);
+            ranges = reduced;
         }
 
         const walker = document.createTreeWalker(
@@ -323,14 +323,15 @@
             nodes.push(walker.currentNode);
         }
 
-        if (!nodes.length) return false;
+        if (!nodes.length) {
+            return false;
+        }
 
         const totalLength = nodes.reduce(
             (sum, node) => sum + node.nodeValue.length,
             0
         );
 
-        // If DOM offsets do not align, leave the original DOM intact.
         if (totalLength !== originalText.length) {
             return false;
         }
@@ -372,7 +373,7 @@
             return false;
         }
 
-        // This is a presentation-only DOM change.
+        // Presentation-only DOM update.
         element.replaceChildren(fragment);
         element.dataset.bsVisualSplit = 'true';
 
@@ -380,7 +381,7 @@
     }
 
     // --------------------------------------------------
-    // MESSAGE LOOKUP AND RENDERING
+    // MESSAGE LOOKUP
     // --------------------------------------------------
 
     function getMessageElements(index) {
@@ -392,81 +393,164 @@
                 `#chat .mes[data-mesid="${index}"]`
             );
 
-        if (!messageElement) return null;
+        if (!messageElement) {
+            return null;
+        }
 
         const textElement = messageElement.querySelector('.mes_text');
 
-        if (!textElement) return null;
-
-        return {
-            messageElement,
-            textElement
-        };
+        return textElement
+            ? { messageElement, textElement }
+            : null;
     }
 
-    function onRendered(id) {
-        if (busy) return;
+    // --------------------------------------------------
+    // RENDER ONE MESSAGE
+    // --------------------------------------------------
 
+    function renderOne(index, options = {}) {
         const settings = getSettings();
 
-        if (!settings.enabled) return;
+        if (!settings.enabled && !options.force) {
+            return false;
+        }
 
         const ctx = SillyTavern.getContext();
-        const index = Number(id);
-
-        if (!Number.isInteger(index) || index < 0) return;
-        if (index >= ctx.chat.length) return;
-
         const message = ctx.chat[index];
 
-        if (!message || message.is_system) return;
+        if (!message || message.is_system) {
+            return false;
+        }
 
         const found = getMessageElements(index);
 
-        if (!found) return;
+        if (!found) {
+            return false;
+        }
 
         const { messageElement, textElement } = found;
 
         if (textElement.dataset.bsVisualSplit === 'true') {
-            return;
+            return false;
         }
 
-        // User and assistant messages receive different palettes.
         const role = message.is_user ? 'user' : 'assistant';
 
-        busy = true;
-
         try {
-            const split = splitRenderedElement(
+            let rendered = splitRenderedElement(
                 textElement,
                 role,
                 settings
             );
 
-            // If splitting isn't needed or safe, still render one bubble.
-            if (!split) {
-                wrapSingleBubble(textElement, role);
+            // If no split is needed, use a single bubble instead.
+            if (!rendered) {
+                rendered = wrapSingleBubble(textElement, role);
             }
 
-            messageElement.dataset.bsVisualRole = role;
+            if (rendered) {
+                messageElement.dataset.bsVisualRole = role;
+            }
+
+            return rendered;
         } catch (error) {
             console.error(
-                '[Bubble Splitter] Rendering failed:',
+                '[Bubble Splitter] Failed to render message',
+                index,
                 error
             );
 
-            // Best-effort fallback: one bubble around the original content.
             try {
-                wrapSingleBubble(textElement, role);
+                const rendered = wrapSingleBubble(textElement, role);
+
+                if (rendered) {
+                    messageElement.dataset.bsVisualRole = role;
+                }
+
+                return rendered;
             } catch (fallbackError) {
                 console.error(
-                    '[Bubble Splitter] Single-bubble fallback failed:',
+                    '[Bubble Splitter] Single-bubble fallback failed',
                     fallbackError
                 );
+
+                return false;
+            }
+        }
+    }
+
+    function onRendered(id) {
+        if (busy) {
+            return;
+        }
+
+        const ctx = SillyTavern.getContext();
+        const index = Number(id);
+
+        if (!Number.isInteger(index) || index < 0) {
+            return;
+        }
+
+        if (index >= ctx.chat.length) {
+            return;
+        }
+
+        busy = true;
+
+        try {
+            renderOne(index);
+        } finally {
+            busy = false;
+        }
+    }
+
+    // --------------------------------------------------
+    // RENDER ALL MESSAGES BUTTON
+    // --------------------------------------------------
+
+    function renderAllMessages() {
+        if (busy) {
+            return;
+        }
+
+        const settings = getSettings();
+
+        if (!settings.enabled) {
+            if (typeof toastr !== 'undefined' && toastr.warning) {
+                toastr.warning(
+                    'Enable Bubble Splitter first, then click Render All Messages.'
+                );
+            }
+
+            return;
+        }
+
+        const ctx = SillyTavern.getContext();
+        const count = Array.isArray(ctx.chat) ? ctx.chat.length : 0;
+
+        let rendered = 0;
+
+        busy = true;
+
+        try {
+            for (let index = 0; index < count; index++) {
+                if (renderOne(index, { force: true })) {
+                    rendered++;
+                }
             }
         } finally {
             busy = false;
         }
+
+        if (typeof toastr !== 'undefined' && toastr.success) {
+            toastr.success(
+                `Processed the open chat. ${rendered} message(s) rendered.`
+            );
+        }
+
+        console.log(
+            `[Bubble Splitter] Render All complete. ${rendered} message(s) processed.`
+        );
     }
 
     // --------------------------------------------------
@@ -474,7 +558,9 @@
     // --------------------------------------------------
 
     function addSettingsUI() {
-        if ($('#bubble_splitter_settings').length) return;
+        if ($('#bubble_splitter_settings').length) {
+            return;
+        }
 
         const settings = getSettings();
 
@@ -511,6 +597,19 @@
                         min="2"
                         max="30">
                 </label>
+
+                <div class="marginTop10">
+                    <button
+                        id="bs_render_all"
+                        class="menu_button"
+                        type="button">
+                        Render All Messages
+                    </button>
+
+                    <small>
+                        Reapply visual bubbles to every message in the currently open chat.
+                    </small>
+                </div>
 
                 <hr>
 
@@ -643,6 +742,8 @@
             updatePalette();
             saveSettings();
         });
+
+        $('#bs_render_all').on('click', renderAllMessages);
     }
 
     // --------------------------------------------------
@@ -670,7 +771,7 @@
         }
 
         console.log(
-            '[Bubble Splitter] Loaded: visual-only bubbles, custom palette, user + assistant support.'
+            '[Bubble Splitter] Loaded. Use Render All Messages to style the current chat.'
         );
     });
 })();
