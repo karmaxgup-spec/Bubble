@@ -1,50 +1,39 @@
 // Bubble Splitter — Visual Only
-// User + assistant bubbles, custom colors, and Render All Messages.
-// Only rendered DOM is modified; chat objects and payloads are not intentionally changed.
+// User + assistant bubbles, custom palette, and manual render-all button.
+// This extension changes rendered DOM only; it does not create or save chat messages.
 
 (() => {
     'use strict';
 
     const MODULE = 'bubble_splitter';
-
     const DEFAULTS = {
         enabled: true,
         minWords: 5,
         maxBubbles: 6,
-
         assistantBg: '#343944',
         assistantBorder: '#555D6B',
         assistantText: '#FFFFFF',
-
         userBg: '#244D70',
         userBorder: '#3979A8',
         userText: '#FFFFFF',
     };
 
     const ABBREVIATIONS = new Set([
-        'mr', 'mrs', 'ms', 'dr', 'prof',
-        'sr', 'jr', 'st', 'vs', 'etc', 'e.g', 'i.e'
+        'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st', 'vs', 'etc', 'e.g', 'i.e'
     ]);
 
     let busy = false;
-
-    // --------------------------------------------------
-    // SETTINGS
-    // --------------------------------------------------
+    let chatObserver = null;
+    let observerScheduled = false;
+    const pendingMessageIndexes = new Set();
 
     function getSettings() {
         const ctx = SillyTavern.getContext();
-
-        if (!ctx.extensionSettings[MODULE]) {
-            ctx.extensionSettings[MODULE] = {};
-        }
-
+        if (!ctx.extensionSettings[MODULE]) ctx.extensionSettings[MODULE] = {};
         const settings = ctx.extensionSettings[MODULE];
 
         for (const [key, value] of Object.entries(DEFAULTS)) {
-            if (!(key in settings)) {
-                settings[key] = value;
-            }
+            if (!(key in settings)) settings[key] = value;
         }
 
         return settings;
@@ -55,19 +44,13 @@
     }
 
     function validColor(value, fallback) {
-        return typeof value === 'string' &&
-            /^#[0-9a-fA-F]{6}$/.test(value)
+        return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value)
             ? value
             : fallback;
     }
 
-    // --------------------------------------------------
-    // COLOR PALETTE
-    // --------------------------------------------------
-
     function updatePalette() {
         const s = getSettings();
-
         let style = document.getElementById('bs-visual-palette');
 
         if (!style) {
@@ -105,7 +88,6 @@
                 --bs-assistant-bg: ${validColor(s.assistantBg, DEFAULTS.assistantBg)};
                 --bs-assistant-border: ${validColor(s.assistantBorder, DEFAULTS.assistantBorder)};
                 --bs-assistant-text: ${validColor(s.assistantText, DEFAULTS.assistantText)};
-
                 --bs-user-bg: ${validColor(s.userBg, DEFAULTS.userBg)};
                 --bs-user-border: ${validColor(s.userBorder, DEFAULTS.userBorder)};
                 --bs-user-text: ${validColor(s.userText, DEFAULTS.userText)};
@@ -113,16 +95,12 @@
         `;
     }
 
-    // --------------------------------------------------
-    // TEXT SPLITTING
-    // --------------------------------------------------
-
     function countWords(text) {
         const value = String(text || '').trim();
         return value ? value.split(/\s+/).length : 0;
     }
 
-    // Keep tool-call JSON together when it appears in rendered text.
+    // Keep tool-call JSON together when it appears in the rendered text.
     function findToolPayload(text) {
         const patterns = [
             /\{\s*"tool_calls"\s*:/,
@@ -134,10 +112,7 @@
         for (const pattern of patterns) {
             const match = pattern.exec(text);
 
-            if (
-                match &&
-                (earliest === -1 || match.index < earliest)
-            ) {
+            if (match && (earliest === -1 || match.index < earliest)) {
                 earliest = match.index;
             }
         }
@@ -147,16 +122,13 @@
 
     function splitText(text) {
         const payloadStart = findToolPayload(text);
-
         const prefix = text.slice(
             0,
             payloadStart === -1 ? text.length : payloadStart
         );
 
         const ranges = [];
-
-        const boundary =
-            /[.!?…]+["'”’)\]*_~]*(?=\s|$)|\n+/g;
+        const boundary = /[.!?…]+["'”’)\]*_~]*(?=\s|$)|\n+/g;
 
         let last = 0;
         let match;
@@ -175,21 +147,14 @@
             }
 
             if (prefix.slice(last, end).trim()) {
-                ranges.push({
-                    start: last,
-                    end
-                });
+                ranges.push({ start: last, end });
             }
 
             last = end;
         }
 
-        // Preserve the remaining text, including the complete detected payload.
         if (last < text.length && text.slice(last).trim()) {
-            ranges.push({
-                start: last,
-                end: text.length
-            });
+            ranges.push({ start: last, end: text.length });
         }
 
         return ranges;
@@ -216,33 +181,47 @@
         const last = nodes[nodes.length - 1];
 
         return last
-            ? {
-                node: last,
-                offset: last.nodeValue.length
-            }
+            ? { node: last, offset: last.nodeValue.length }
             : null;
     }
 
-    // --------------------------------------------------
-    // BUBBLE CREATION
-    // --------------------------------------------------
-
     function createBubble(content, role) {
         const bubble = document.createElement('div');
-
         bubble.className = 'bs-visual-bubble';
         bubble.dataset.bsRole = role;
-
         bubble.appendChild(content);
 
         return bubble;
     }
 
-    // Always display at least one bubble.
-    function wrapSingleBubble(element, role) {
-        if (!element || !element.isConnected) {
-            return false;
+    function unwrapVisualBubbles(element) {
+        if (!element) return;
+
+        // Only unwrap our own top-level wrappers.
+        // Preserve the original markdown and code DOM.
+        for (const bubble of Array.from(
+            element.querySelectorAll(':scope > .bs-visual-bubble')
+        )) {
+            while (bubble.firstChild) {
+                element.insertBefore(bubble.firstChild, bubble);
+            }
+
+            bubble.remove();
         }
+
+        delete element.dataset.bsVisualSplit;
+        delete element.dataset.bsVisualText;
+    }
+
+    function isMessageBeingEdited(messageElement) {
+        // Never wrap the edit textarea while SillyTavern is in edit mode.
+        return Boolean(messageElement.querySelector(
+            'textarea.mes_edit_textarea, .mes_edit_textarea, textarea.edit_textarea, .edit_textarea'
+        ));
+    }
+
+    function wrapSingleBubble(element, role) {
+        if (!element || !element.isConnected) return false;
 
         if (element.dataset.bsVisualSplit === 'true') {
             return true;
@@ -256,14 +235,13 @@
 
         element.appendChild(createBubble(content, role));
         element.dataset.bsVisualSplit = 'true';
+        element.dataset.bsVisualText = element.textContent || '';
 
         return true;
     }
 
     function splitRenderedElement(element, role, settings) {
-        if (!element || !element.isConnected) {
-            return false;
-        }
+        if (!element || !element.isConnected) return false;
 
         if (element.dataset.bsVisualSplit === 'true') {
             return true;
@@ -275,7 +253,6 @@
             return false;
         }
 
-        // Avoid splitting code and preformatted content.
         if (element.querySelector('pre, code, .code-block')) {
             return false;
         }
@@ -288,10 +265,7 @@
 
         const max = Math.max(
             2,
-            Math.min(
-                30,
-                Number(settings.maxBubbles) || DEFAULTS.maxBubbles
-            )
+            Math.min(30, Number(settings.maxBubbles) || DEFAULTS.maxBubbles)
         );
 
         if (ranges.length > max) {
@@ -323,9 +297,7 @@
             nodes.push(walker.currentNode);
         }
 
-        if (!nodes.length) {
-            return false;
-        }
+        if (!nodes.length) return false;
 
         const totalLength = nodes.reduce(
             (sum, node) => sum + node.nodeValue.length,
@@ -339,17 +311,8 @@
         const fragment = document.createDocumentFragment();
 
         for (const part of ranges) {
-            const start = locateOffset(
-                nodes,
-                part.start,
-                totalLength
-            );
-
-            const end = locateOffset(
-                nodes,
-                part.end,
-                totalLength
-            );
+            const start = locateOffset(nodes, part.start, totalLength);
+            const end = locateOffset(nodes, part.end, totalLength);
 
             if (!start || !end || part.end <= part.start) {
                 continue;
@@ -373,29 +336,19 @@
             return false;
         }
 
-        // Presentation-only DOM update.
         element.replaceChildren(fragment);
         element.dataset.bsVisualSplit = 'true';
+        element.dataset.bsVisualText = element.textContent || '';
 
         return true;
     }
 
-    // --------------------------------------------------
-    // MESSAGE LOOKUP
-    // --------------------------------------------------
-
     function getMessageElements(index) {
         const messageElement =
-            document.querySelector(
-                `#chat .mes[mesid="${index}"]`
-            ) ||
-            document.querySelector(
-                `#chat .mes[data-mesid="${index}"]`
-            );
+            document.querySelector(`#chat .mes[mesid="${index}"]`) ||
+            document.querySelector(`#chat .mes[data-mesid="${index}"]`);
 
-        if (!messageElement) {
-            return null;
-        }
+        if (!messageElement) return null;
 
         const textElement = messageElement.querySelector('.mes_text');
 
@@ -403,10 +356,6 @@
             ? { messageElement, textElement }
             : null;
     }
-
-    // --------------------------------------------------
-    // RENDER ONE MESSAGE
-    // --------------------------------------------------
 
     function renderOne(index, options = {}) {
         const settings = getSettings();
@@ -430,20 +379,34 @@
 
         const { messageElement, textElement } = found;
 
-        if (textElement.dataset.bsVisualSplit === 'true') {
+        if (isMessageBeingEdited(messageElement)) {
             return false;
         }
 
         const role = message.is_user ? 'user' : 'assistant';
+        const currentText = textElement.textContent || '';
+        const alreadyRendered = textElement.dataset.bsVisualSplit === 'true';
+        const previousText = textElement.dataset.bsVisualText;
+
+        // Re-render if the message's text changed after editing.
+        // Force mode also deliberately reapplies the visual wrappers.
+        if (
+            alreadyRendered &&
+            !options.force &&
+            previousText === currentText
+        ) {
+            return false;
+        }
+
+        if (alreadyRendered) {
+            unwrapVisualBubbles(textElement);
+        }
+
+        let rendered = false;
 
         try {
-            let rendered = splitRenderedElement(
-                textElement,
-                role,
-                settings
-            );
+            rendered = splitRenderedElement(textElement, role, settings);
 
-            // If no split is needed, use a single bubble instead.
             if (!rendered) {
                 rendered = wrapSingleBubble(textElement, role);
             }
@@ -461,37 +424,33 @@
             );
 
             try {
-                const rendered = wrapSingleBubble(textElement, role);
+                rendered = wrapSingleBubble(textElement, role);
 
                 if (rendered) {
                     messageElement.dataset.bsVisualRole = role;
                 }
-
-                return rendered;
             } catch (fallbackError) {
                 console.error(
                     '[Bubble Splitter] Single-bubble fallback failed',
                     fallbackError
                 );
-
-                return false;
             }
+
+            return rendered;
         }
     }
 
     function onRendered(id) {
-        if (busy) {
-            return;
-        }
+        if (busy) return;
 
         const ctx = SillyTavern.getContext();
         const index = Number(id);
 
-        if (!Number.isInteger(index) || index < 0) {
-            return;
-        }
-
-        if (index >= ctx.chat.length) {
+        if (
+            !Number.isInteger(index) ||
+            index < 0 ||
+            index >= ctx.chat.length
+        ) {
             return;
         }
 
@@ -504,14 +463,10 @@
         }
     }
 
-    // --------------------------------------------------
-    // RENDER ALL MESSAGES BUTTON
-    // --------------------------------------------------
-
+    // Re-render all messages in the currently open chat.
+    // This changes the DOM only and does not save chat data.
     function renderAllMessages() {
-        if (busy) {
-            return;
-        }
+        if (busy) return;
 
         const settings = getSettings();
 
@@ -553,9 +508,103 @@
         );
     }
 
-    // --------------------------------------------------
-    // SETTINGS UI
-    // --------------------------------------------------
+    function queueMessageRender(index) {
+        if (!Number.isInteger(index) || index < 0) {
+            return;
+        }
+
+        pendingMessageIndexes.add(index);
+
+        if (observerScheduled) {
+            return;
+        }
+
+        observerScheduled = true;
+
+        setTimeout(() => {
+            observerScheduled = false;
+
+            if (busy) {
+                return;
+            }
+
+            const indexes = Array.from(pendingMessageIndexes);
+            pendingMessageIndexes.clear();
+
+            busy = true;
+
+            try {
+                for (const messageIndex of indexes) {
+                    renderOne(messageIndex);
+                }
+            } finally {
+                busy = false;
+            }
+        }, 0);
+    }
+
+    function installChatObserver() {
+        if (chatObserver || !document.body) {
+            return;
+        }
+
+        chatObserver = new MutationObserver(records => {
+            for (const record of records) {
+                const node =
+                    record.target && record.target.nodeType === Node.ELEMENT_NODE
+                        ? record.target
+                        : record.target && record.target.parentElement;
+
+                const messageElement =
+                    node && node.closest
+                        ? node.closest('#chat .mes')
+                        : null;
+
+                if (messageElement) {
+                    const rawIndex =
+                        messageElement.getAttribute('mesid') ??
+                        messageElement.getAttribute('data-mesid');
+
+                    if (rawIndex !== null) {
+                        queueMessageRender(Number(rawIndex));
+                    }
+                }
+
+                for (const added of record.addedNodes || []) {
+                    if (added.nodeType !== Node.ELEMENT_NODE) {
+                        continue;
+                    }
+
+                    const candidates = [];
+
+                    if (added.matches && added.matches('#chat .mes')) {
+                        candidates.push(added);
+                    }
+
+                    if (added.querySelectorAll) {
+                        candidates.push(...added.querySelectorAll('#chat .mes'));
+                    }
+
+                    for (const candidate of candidates) {
+                        const rawIndex =
+                            candidate.getAttribute('mesid') ??
+                            candidate.getAttribute('data-mesid');
+
+                        if (rawIndex !== null) {
+                            queueMessageRender(Number(rawIndex));
+                        }
+                    }
+                }
+            }
+        });
+
+        // Watching the body also catches #chat being replaced during chat switches.
+        chatObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true
+        });
+    }
 
     function addSettingsUI() {
         if ($('#bubble_splitter_settings').length) {
@@ -572,7 +621,6 @@
             </div>
 
             <div class="inline-drawer-content">
-
                 <label class="checkbox_label">
                     <input id="bs_enabled" type="checkbox">
                     <span>Enable bubble styling and splitting</span>
@@ -580,131 +628,71 @@
 
                 <label>
                     Split messages longer than (words)
-                    <input
-                        id="bs_min_words"
-                        class="text_pole"
-                        type="number"
-                        min="1"
-                        max="500">
+                    <input id="bs_min_words" class="text_pole" type="number" min="1" max="500">
                 </label>
 
                 <label>
                     Maximum bubbles per message
-                    <input
-                        id="bs_max_bubbles"
-                        class="text_pole"
-                        type="number"
-                        min="2"
-                        max="30">
+                    <input id="bs_max_bubbles" class="text_pole" type="number" min="2" max="30">
                 </label>
 
                 <div class="marginTop10">
-                    <button
-                        id="bs_render_all"
-                        class="menu_button"
-                        type="button">
+                    <button id="bs_render_all" class="menu_button" type="button">
                         Render All Messages
                     </button>
-
-                    <small>
-                        Reapply visual bubbles to every message in the currently open chat.
-                    </small>
+                    <small>Reapply visual bubbles to every message in the currently open chat.</small>
                 </div>
 
                 <hr>
-
                 <h4>Assistant bubble palette</h4>
-
-                <label>
-                    Background
-                    <input id="bs_assistant_bg" type="color">
-                </label>
-
-                <label>
-                    Border
-                    <input id="bs_assistant_border" type="color">
-                </label>
-
-                <label>
-                    Text
-                    <input id="bs_assistant_text" type="color">
-                </label>
+                <label>Background<input id="bs_assistant_bg" type="color"></label>
+                <label>Border<input id="bs_assistant_border" type="color"></label>
+                <label>Text<input id="bs_assistant_text" type="color"></label>
 
                 <hr>
-
                 <h4>User bubble palette</h4>
-
-                <label>
-                    Background
-                    <input id="bs_user_bg" type="color">
-                </label>
-
-                <label>
-                    Border
-                    <input id="bs_user_border" type="color">
-                </label>
-
-                <label>
-                    Text
-                    <input id="bs_user_text" type="color">
-                </label>
+                <label>Background<input id="bs_user_bg" type="color"></label>
+                <label>Border<input id="bs_user_border" type="color"></label>
+                <label>Text<input id="bs_user_text" type="color"></label>
 
                 <hr>
-
-                <button
-                    id="bs_reset_palette"
-                    class="menu_button"
-                    type="button">
+                <button id="bs_reset_palette" class="menu_button" type="button">
                     Reset default colors
                 </button>
-
             </div>
         </div>`;
 
         $('#extensions_settings2').append(html);
 
-        $('#bs_enabled')
-            .prop('checked', settings.enabled)
-            .on('change', function () {
-                settings.enabled = this.checked;
-                saveSettings();
-            });
+        $('#bs_enabled').prop('checked', settings.enabled).on('change', function () {
+            settings.enabled = this.checked;
+            saveSettings();
+        });
 
-        $('#bs_min_words')
-            .val(settings.minWords)
-            .on('change', function () {
-                settings.minWords = Math.max(
-                    1,
-                    Math.min(
-                        500,
-                        Number(this.value) || DEFAULTS.minWords
-                    )
-                );
+        $('#bs_min_words').val(settings.minWords).on('change', function () {
+            settings.minWords = Math.max(
+                1,
+                Math.min(500, Number(this.value) || DEFAULTS.minWords)
+            );
 
-                $(this).val(settings.minWords);
-                saveSettings();
-            });
+            $(this).val(settings.minWords);
+            saveSettings();
+        });
 
-        $('#bs_max_bubbles')
-            .val(settings.maxBubbles)
-            .on('change', function () {
-                settings.maxBubbles = Math.max(
-                    2,
-                    Math.min(
-                        30,
-                        Number(this.value) || DEFAULTS.maxBubbles
-                    )
-                );
+        $('#bs_max_bubbles').val(settings.maxBubbles).on('change', function () {
+            settings.maxBubbles = Math.max(
+                2,
+                Math.min(30, Number(this.value) || DEFAULTS.maxBubbles)
+            );
 
-                $(this).val(settings.maxBubbles);
-                saveSettings();
-            });
+            $(this).val(settings.maxBubbles);
+            saveSettings();
+        });
 
         const colorControls = {
             '#bs_assistant_bg': 'assistantBg',
             '#bs_assistant_border': 'assistantBorder',
             '#bs_assistant_text': 'assistantText',
-
             '#bs_user_bg': 'userBg',
             '#bs_user_border': 'userBorder',
             '#bs_user_text': 'userText'
@@ -714,11 +702,7 @@
             $(selector)
                 .val(validColor(settings[key], DEFAULTS[key]))
                 .on('input change', function () {
-                    settings[key] = validColor(
-                        this.value,
-                        DEFAULTS[key]
-                    );
-
+                    settings[key] = validColor(this.value, DEFAULTS[key]);
                     updatePalette();
                     saveSettings();
                 });
@@ -746,10 +730,6 @@
         $('#bs_render_all').on('click', renderAllMessages);
     }
 
-    // --------------------------------------------------
-    // INITIALIZATION
-    // --------------------------------------------------
-
     jQuery(() => {
         const { eventSource, eventTypes } = SillyTavern.getContext();
 
@@ -770,8 +750,13 @@
             );
         }
 
+        installChatObserver();
+
+        // Initial pass handles messages rendered before the extension loaded.
+        setTimeout(renderAllMessages, 0);
+
         console.log(
-            '[Bubble Splitter] Loaded. Use Render All Messages to style the current chat.'
+            '[Bubble Splitter] Loaded. Existing and newly rendered messages will be styled automatically.'
         );
     });
 })();
