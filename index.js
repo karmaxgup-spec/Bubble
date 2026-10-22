@@ -1,6 +1,6 @@
 // Bubble Splitter — Visual Only
-// Supports user and assistant messages with customizable color palettes.
-// Never creates chat messages or modifies message payloads/history.
+// User + assistant bubbles, custom colors, single-bubble fallback.
+// Only rendered DOM is modified. Chat objects and payloads are not modified.
 
 (() => {
     'use strict';
@@ -29,7 +29,7 @@
     let busy = false;
 
     // --------------------------------------------------
-    // Settings
+    // SETTINGS
     // --------------------------------------------------
 
     function getSettings() {
@@ -55,13 +55,16 @@
     }
 
     function validColor(value, fallback) {
-        return /^#[0-9a-fA-F]{6}$/.test(value)
+        return typeof value === 'string' &&
+            /^#[0-9a-fA-F]{6}$/.test(value)
             ? value
             : fallback;
     }
 
-    // Use CSS variables so changing the palette also recolors
-    // bubbles that have already been rendered.
+    // --------------------------------------------------
+    // CUSTOM COLOR PALETTE
+    // --------------------------------------------------
+
     function updatePalette() {
         const s = getSettings();
 
@@ -75,16 +78,16 @@
 
         style.textContent = `
             #chat .mes .bs-visual-bubble {
-                box-sizing: border-box;
                 display: block;
                 width: fit-content;
                 max-width: 100%;
+                box-sizing: border-box;
                 margin: 0 0 0.55em 0;
                 padding: 0.45em 0.7em;
                 border-radius: 0.8em;
                 white-space: pre-wrap;
                 overflow-wrap: anywhere;
-                box-shadow: none;
+                word-break: normal;
             }
 
             #chat .mes .bs-visual-bubble[data-bs-role="assistant"] {
@@ -112,14 +115,15 @@
     }
 
     // --------------------------------------------------
-    // Splitting
+    // TEXT SPLITTING
     // --------------------------------------------------
 
     function countWords(text) {
-        const value = text.trim();
+        const value = String(text || '').trim();
         return value ? value.split(/\s+/).length : 0;
     }
 
+    // Keep tool-call JSON together instead of splitting its fields.
     function findToolPayload(text) {
         const patterns = [
             /\{\s*"tool_calls"\s*:/,
@@ -142,7 +146,7 @@
     function splitText(text) {
         const payloadStart = findToolPayload(text);
 
-        // Do not split inside a detected tool-call payload.
+        // Never create sentence boundaries inside the detected JSON payload.
         const splitLimit = payloadStart === -1
             ? text.length
             : payloadStart;
@@ -150,8 +154,9 @@
         const prefix = text.slice(0, splitLimit);
         const ranges = [];
 
-        // Split at sentence endings OR line breaks.
-        const boundary = /[.!?…]+["'”’)\]*_~]*(?=\s|$)|\n+/g;
+        // Split at sentence-ending punctuation and line breaks.
+        const boundary =
+            /[.!?…]+["'”’)\]*_~]*(?=\s|$)|\n+/g;
 
         let last = 0;
         let match;
@@ -159,28 +164,32 @@
         while ((match = boundary.exec(prefix)) !== null) {
             const end = match.index + match[0].length;
             const before = prefix.slice(last, match.index);
+            const word = before.match(/([A-Za-z.]+)$/);
 
-            if (/^[.!?…]/.test(match[0])) {
-                const word = before.match(/([A-Za-z.]+)$/);
-
-                if (
-                    match[0].startsWith('.') &&
-                    word &&
-                    ABBREVIATIONS.has(word[1].toLowerCase())
-                ) {
-                    continue;
-                }
+            if (
+                /^[.]/.test(match[0]) &&
+                word &&
+                ABBREVIATIONS.has(word[1].toLowerCase())
+            ) {
+                continue;
             }
 
             if (prefix.slice(last, end).trim()) {
-                ranges.push({ start: last, end });
+                ranges.push({
+                    start: last,
+                    end
+                });
             }
 
             last = end;
         }
 
+        // Preserve all remaining text, including any complete JSON payload.
         if (last < text.length && text.slice(last).trim()) {
-            ranges.push({ start: last, end: text.length });
+            ranges.push({
+                start: last,
+                end: text.length
+            });
         }
 
         return ranges;
@@ -207,9 +216,16 @@
         const last = nodes[nodes.length - 1];
 
         return last
-            ? { node: last, offset: last.nodeValue.length }
+            ? {
+                node: last,
+                offset: last.nodeValue.length
+            }
             : null;
     }
+
+    // --------------------------------------------------
+    // BUBBLE CREATION
+    // --------------------------------------------------
 
     function createBubble(content, role) {
         const bubble = document.createElement('div');
@@ -222,29 +238,61 @@
         return bubble;
     }
 
+    // Every message gets at least one bubble, even if it is short.
+    function wrapSingleBubble(element, role) {
+        if (!element || !element.isConnected) return false;
+
+        if (element.dataset.bsVisualSplit === 'true') {
+            return true;
+        }
+
+        const content = document.createDocumentFragment();
+
+        while (element.firstChild) {
+            content.appendChild(element.firstChild);
+        }
+
+        element.appendChild(createBubble(content, role));
+        element.dataset.bsVisualSplit = 'true';
+
+        return true;
+    }
+
+    // Split only the already-rendered DOM. No chat data is written.
     function splitRenderedElement(element, role, settings) {
-        if (!element || !element.isConnected) return;
+        if (!element || !element.isConnected) return false;
 
-        if (element.dataset.bsVisualSplit === 'true') return;
-
-        // Avoid rewriting code editors and code blocks.
-        if (element.querySelector('pre, code, .code-block')) return;
+        if (element.dataset.bsVisualSplit === 'true') {
+            return true;
+        }
 
         const originalText = element.textContent || '';
 
+        // Short messages still receive a single styled bubble.
         if (countWords(originalText) <= Number(settings.minWords)) {
-            return;
+            return false;
         }
 
         const ranges = splitText(originalText);
 
-        if (ranges.length < 2) return;
+        if (ranges.length < 2) {
+            return false;
+        }
+
+        // Keep splitting from touching code blocks or preformatted content.
+        if (element.querySelector('pre, code, .code-block')) {
+            return false;
+        }
 
         const max = Math.max(
             2,
-            Math.min(30, Number(settings.maxBubbles) || DEFAULTS.maxBubbles)
+            Math.min(
+                30,
+                Number(settings.maxBubbles) || DEFAULTS.maxBubbles
+            )
         );
 
+        // Merge excess ranges into the final bubble.
         if (ranges.length > max) {
             const reduced = ranges.slice(0, max - 1);
 
@@ -275,23 +323,36 @@
             nodes.push(walker.currentNode);
         }
 
-        if (!nodes.length) return;
+        if (!nodes.length) return false;
 
         const totalLength = nodes.reduce(
             (sum, node) => sum + node.nodeValue.length,
             0
         );
 
-        // If DOM text offsets don't match, leave the message untouched.
-        if (totalLength !== originalText.length) return;
+        // If DOM offsets do not align, leave the original DOM intact.
+        if (totalLength !== originalText.length) {
+            return false;
+        }
 
         const fragment = document.createDocumentFragment();
 
         for (const part of ranges) {
-            const start = locateOffset(nodes, part.start, totalLength);
-            const end = locateOffset(nodes, part.end, totalLength);
+            const start = locateOffset(
+                nodes,
+                part.start,
+                totalLength
+            );
 
-            if (!start || !end || part.end <= part.start) continue;
+            const end = locateOffset(
+                nodes,
+                part.end,
+                totalLength
+            );
+
+            if (!start || !end || part.end <= part.start) {
+                continue;
+            }
 
             const range = document.createRange();
 
@@ -300,31 +361,36 @@
 
             const content = range.cloneContents();
 
-            if (!(content.textContent || '').trim()) continue;
+            if (!(content.textContent || '').trim()) {
+                continue;
+            }
 
             fragment.appendChild(createBubble(content, role));
         }
 
-        if (!fragment.childNodes.length) return;
+        if (!fragment.childNodes.length) {
+            return false;
+        }
 
-        // DOM-only transformation. No chat object or payload is modified.
+        // This is a presentation-only DOM change.
         element.replaceChildren(fragment);
         element.dataset.bsVisualSplit = 'true';
+
+        return true;
     }
 
     // --------------------------------------------------
-    // Message rendering
+    // MESSAGE LOOKUP AND RENDERING
     // --------------------------------------------------
 
-    function getMessage(index) {
-        const ctx = SillyTavern.getContext();
-        const message = ctx.chat[index];
-
-        if (!message) return null;
-
+    function getMessageElements(index) {
         const messageElement =
-            document.querySelector(`#chat .mes[mesid="${index}"]`) ||
-            document.querySelector(`#chat .mes[data-mesid="${index}"]`);
+            document.querySelector(
+                `#chat .mes[mesid="${index}"]`
+            ) ||
+            document.querySelector(
+                `#chat .mes[data-mesid="${index}"]`
+            );
 
         if (!messageElement) return null;
 
@@ -332,7 +398,10 @@
 
         if (!textElement) return null;
 
-        return { message, messageElement, textElement };
+        return {
+            messageElement,
+            textElement
+        };
     }
 
     function onRendered(id) {
@@ -348,44 +417,60 @@
         if (!Number.isInteger(index) || index < 0) return;
         if (index >= ctx.chat.length) return;
 
-        const found = getMessage(index);
+        const message = ctx.chat[index];
+
+        if (!message || message.is_system) return;
+
+        const found = getMessageElements(index);
 
         if (!found) return;
 
-        const { message, messageElement, textElement } = found;
+        const { messageElement, textElement } = found;
 
-        if (message.is_system) return;
-
-        if (textElement.dataset.bsVisualSplit === 'true') return;
-
-        const role = message.is_user ? 'user' : 'assistant';
-
-        // Don't alter the message object. Only inspect its existing content.
-        const originalText = message.mes ?? '';
-
-        if (countWords(originalText) <= Number(settings.minWords)) {
+        if (textElement.dataset.bsVisualSplit === 'true') {
             return;
         }
+
+        // User and assistant messages receive different palettes.
+        const role = message.is_user ? 'user' : 'assistant';
 
         busy = true;
 
         try {
-            splitRenderedElement(textElement, role, settings);
+            const split = splitRenderedElement(
+                textElement,
+                role,
+                settings
+            );
 
-            // Add role metadata to the containing message for styling/debugging.
-            // This is a DOM attribute, not a chat-history change.
-            if (textElement.dataset.bsVisualSplit === 'true') {
-                messageElement.dataset.bsVisualRole = role;
+            // If splitting isn't needed or safe, still render one bubble.
+            if (!split) {
+                wrapSingleBubble(textElement, role);
             }
+
+            messageElement.dataset.bsVisualRole = role;
         } catch (error) {
-            console.error('[Bubble Splitter] visual split failed:', error);
+            console.error(
+                '[Bubble Splitter] Rendering failed:',
+                error
+            );
+
+            // Best-effort fallback: one bubble around the original content.
+            try {
+                wrapSingleBubble(textElement, role);
+            } catch (fallbackError) {
+                console.error(
+                    '[Bubble Splitter] Single-bubble fallback failed:',
+                    fallbackError
+                );
+            }
         } finally {
             busy = false;
         }
     }
 
     // --------------------------------------------------
-    // Settings interface
+    // SETTINGS UI
     // --------------------------------------------------
 
     function addSettingsUI() {
@@ -401,23 +486,30 @@
             </div>
 
             <div class="inline-drawer-content">
+
                 <label class="checkbox_label">
                     <input id="bs_enabled" type="checkbox">
-                    <span>Enable bubble splitting</span>
+                    <span>Enable bubble styling and splitting</span>
                 </label>
 
                 <label>
-                    Minimum words per message
-                    <input id="bs_min_words"
+                    Split messages longer than (words)
+                    <input
+                        id="bs_min_words"
                         class="text_pole"
-                        type="number" min="1" max="500">
+                        type="number"
+                        min="1"
+                        max="500">
                 </label>
 
                 <label>
                     Maximum bubbles per message
-                    <input id="bs_max_bubbles"
+                    <input
+                        id="bs_max_bubbles"
                         class="text_pole"
-                        type="number" min="2" max="30">
+                        type="number"
+                        min="2"
+                        max="30">
                 </label>
 
                 <hr>
@@ -460,9 +552,13 @@
 
                 <hr>
 
-                <button id="bs_reset_palette" class="menu_button">
+                <button
+                    id="bs_reset_palette"
+                    class="menu_button"
+                    type="button">
                     Reset default colors
                 </button>
+
             </div>
         </div>`;
 
@@ -480,7 +576,10 @@
             .on('change', function () {
                 settings.minWords = Math.max(
                     1,
-                    Math.min(500, Number(this.value) || DEFAULTS.minWords)
+                    Math.min(
+                        500,
+                        Number(this.value) || DEFAULTS.minWords
+                    )
                 );
 
                 $(this).val(settings.minWords);
@@ -492,7 +591,10 @@
             .on('change', function () {
                 settings.maxBubbles = Math.max(
                     2,
-                    Math.min(30, Number(this.value) || DEFAULTS.maxBubbles)
+                    Math.min(
+                        30,
+                        Number(this.value) || DEFAULTS.maxBubbles
+                    )
                 );
 
                 $(this).val(settings.maxBubbles);
@@ -503,9 +605,10 @@
             '#bs_assistant_bg': 'assistantBg',
             '#bs_assistant_border': 'assistantBorder',
             '#bs_assistant_text': 'assistantText',
+
             '#bs_user_bg': 'userBg',
             '#bs_user_border': 'userBorder',
-            '#bs_user_text': 'userText',
+            '#bs_user_text': 'userText'
         };
 
         for (const [selector, key] of Object.entries(colorControls)) {
@@ -524,9 +627,11 @@
 
         $('#bs_reset_palette').on('click', function () {
             for (const key of Object.keys(DEFAULTS)) {
-                if (key.endsWith('Bg') ||
+                if (
+                    key.endsWith('Bg') ||
                     key.endsWith('Border') ||
-                    key.endsWith('Text')) {
+                    key.endsWith('Text')
+                ) {
                     settings[key] = DEFAULTS[key];
                 }
             }
@@ -541,7 +646,7 @@
     }
 
     // --------------------------------------------------
-    // Initialize
+    // INITIALIZATION
     // --------------------------------------------------
 
     jQuery(() => {
@@ -550,7 +655,6 @@
         addSettingsUI();
         updatePalette();
 
-        // Assistant responses.
         if (eventTypes.CHARACTER_MESSAGE_RENDERED) {
             eventSource.on(
                 eventTypes.CHARACTER_MESSAGE_RENDERED,
@@ -558,7 +662,6 @@
             );
         }
 
-        // User messages.
         if (eventTypes.USER_MESSAGE_RENDERED) {
             eventSource.on(
                 eventTypes.USER_MESSAGE_RENDERED,
@@ -567,7 +670,7 @@
         }
 
         console.log(
-            '[Bubble Splitter] Loaded: user + assistant bubbles, custom palette, visual-only mode.'
+            '[Bubble Splitter] Loaded: visual-only bubbles, custom palette, user + assistant support.'
         );
     });
 })();
